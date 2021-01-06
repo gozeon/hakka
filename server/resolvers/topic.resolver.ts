@@ -1,5 +1,5 @@
 import { Context, GqlContext } from '@server/decorators/gql-context'
-import { requireAuth } from '@server/guards/require-auth'
+import { isAdmin, requireAuth } from '@server/guards/require-auth'
 import { renderMarkdown } from '@server/lib/markdown'
 import { getRepos } from '@server/orm'
 import { ApolloError } from 'apollo-server-micro'
@@ -11,17 +11,19 @@ import {
   Query,
   Resolver,
   ObjectType,
-  ID,
   Mutation,
   FieldResolver,
   Root,
 } from 'type-graphql'
 import { Node } from './node.resolver'
+import { Comment } from './comment.resolver'
+import { getConnection } from '@server/orm'
+import { parseURL } from '@server/lib/utils'
 
 @ArgsType()
 class TopicsArgs {
   @Field((type) => Int, {
-    defaultValue: 30,
+    defaultValue: 100,
   })
   take: number
 
@@ -65,6 +67,9 @@ export class Topic {
 
   @Field((type) => Int)
   nodeId: number
+
+  @Field((type) => Int, { nullable: true })
+  lastCommentId?: number
 
   @Field({
     nullable: true,
@@ -130,27 +135,35 @@ class LikeTopicArgs {
   topicId: number
 }
 
+@ObjectType()
+class TopicExternalLink {
+  @Field()
+  url: string
+
+  @Field()
+  domain: string
+}
+
 @Resolver((of) => Topic)
 export class TopicResolver {
   @Query((returns) => TopicsConnection)
   async topics(@GqlContext() ctx: Context, @Args() args: TopicsArgs) {
     const skip = (args.page - 1) * args.take
-    const repos = await getRepos()
-    const topics = await repos.topic.find({
-      order: {
-        createdAt: 'DESC',
-      },
-      relations: ['comments', 'author'],
-      take: args.take + 1,
-      skip,
-    })
+    const connection = await getConnection()
+    const topics = await connection.query(
+      `
+    select "topic".* from "topic" "topic"
+    left join "comment" "lastComment"
+      on "lastComment"."id" = "topic"."lastCommentId"
+    order by
+      case when "lastComment" is null then "topic"."createdAt" else "lastComment"."createdAt" end DESC
+    limit $1
+    offset $2
+    `,
+      [args.take + 1, skip],
+    )
     return {
-      items: topics.slice(0, args.take).map((topic) => {
-        return {
-          ...topic,
-          commentsCount: topic.comments.length,
-        }
-      }),
+      items: topics.slice(0, args.take),
       hasNext: topics.length > args.take,
       hasPrev: args.page !== 1,
     }
@@ -234,6 +247,23 @@ export class TopicResolver {
     return Boolean(record)
   }
 
+  @FieldResolver((returns) => Comment, { nullable: true })
+  async lastComment(@Root() topic: Topic) {
+    const repos = await getRepos()
+    return repos.comment.findOne({ id: topic.lastCommentId })
+  }
+
+  @FieldResolver((returns) => TopicExternalLink, { nullable: true })
+  externalLink(@Root() topic: Topic) {
+    const url = parseURL(topic.content.trim().split(/[\s\n]/)[0])
+    if (url) {
+      return {
+        url: url.href,
+        domain: url.hostname.replace(/^www\./, ''),
+      }
+    }
+  }
+
   @Mutation((returns) => Topic)
   async createTopic(@GqlContext() ctx: Context, @Args() args: CreateTopicArgs) {
     const user = requireAuth(ctx)
@@ -272,7 +302,9 @@ export class TopicResolver {
     if (!topic) {
       throw new ApolloError(`主题不存在`)
     }
-    if (topic.authorId !== user.id) {
+
+    // Allow the author and admins to update the topic
+    if (topic.authorId !== user.id && !isAdmin(user)) {
       throw new ApolloError(`没有访问权限`)
     }
 

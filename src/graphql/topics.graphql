@@ -7,8 +7,15 @@ query topics($page: Int!) {
       title
       commentsCount
       likesCount
-      url
-      domain
+      externalLink {
+        url
+        domain
+      }
+      lastComment {
+        author {
+          username
+        }
+      }
       node {
         id
         slug
